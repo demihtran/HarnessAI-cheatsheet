@@ -189,11 +189,10 @@
       color: #173b4f;
       font-size: 11px;
       line-height: 1.55;
-      white-space: pre;
     }
     pre[class*="language-"],
     code[class*="language-"] {
-      background: #f7fbff;
+      background: #f7fbff !important;
       color: #172033;
       text-shadow: none;
       font-size: 11px;
@@ -202,15 +201,6 @@
       border-left-color: var(--code-line);
       box-shadow: inset 0 0 0 1px rgba(15, 118, 110, .16), 0 8px 18px rgba(36, 88, 154, .08);
     }
-    .token.comment, .token.prolog, .token.doctype, .token.cdata { color: #69758a; font-style: italic; }
-    .token.keyword { color: #0f766e; font-weight: 900; }
-    .token.string, .token.char { color: #047857; font-weight: 650; }
-    .token.function { color: #0369a1; font-weight: 800; }
-    .token.class-name, .token.constant { color: #b45309; font-weight: 850; }
-    .token.number, .token.boolean { color: #dc2626; font-weight: 800; }
-    .token.operator, .token.punctuation { color: #334155; }
-    .token.builtin, .token.decorator { color: #be185d; font-weight: 800; }
-    .token.attr-name, .token.property { color: #c2410c; font-weight: 750; }
 
     .note {
       display: grid;
@@ -391,7 +381,7 @@ request
           <div class="icon violet">K</div>
           <div>
             <h2>Harness Kernel</h2>
-            <div class="caption">Pattern nâng cao: middleware stack thống nhất cho mọi agent/RAG request</div>
+            <div class="caption">Pattern nâng cao: middleware stack async thống nhất cho mọi agent/RAG request</div>
           </div>
         </div>
         <div class="body">
@@ -410,27 +400,31 @@ class RunContext:
     trace: list[dict[str, Any]] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
 
+# Khai báo async middleware interface
 class Middleware(Protocol):
-    def before(self, ctx: RunContext) -> RunContext: ...
-    def after(self, ctx: RunContext, result: dict[str, Any]) -> dict[str, Any]: ...
+    async def before(self, ctx: RunContext) -> RunContext: ...
+    async def after(self, ctx: RunContext, result: dict[str, Any]) -> dict[str, Any]: ...
 
 class HarnessKernel:
     def __init__(self, middlewares: list[Middleware], app):
         self.middlewares = middlewares
         self.app = app
 
-    def invoke(self, task: str, user_id: str, tenant_id: str) -> dict[str, Any]:
+    async def ainvoke(self, task: str, user_id: str, tenant_id: str) -> dict[str, Any]:
         ctx = RunContext(run_id=f"run_{uuid4().hex[:10]}", user_id=user_id, tenant_id=tenant_id, task=task)
+        
+        # Thực thi async các middleware tiền xử lý
         for middleware in self.middlewares:
-            ctx = middleware.before(ctx)
+            ctx = await middleware.before(ctx)
 
-        result = self.app.run(ctx)
+        # Chạy core agent/application async
+        result = await self.app.ainvoke(ctx)
 
+        # Thực thi async các middleware hậu xử lý ngược lại
         for middleware in reversed(self.middlewares):
-            result = middleware.after(ctx, result)
-        return {"run_id": ctx.run_id, "result": result, "trace": ctx.trace, "evidence": ctx.evidence}
-
-# kernel = HarnessKernel([Security(), Context(), Policy(), Ops(), EvalSample()], agent_graph)</code></pre>
+            result = await middleware.after(ctx, result)
+            
+        return {"run_id": ctx.run_id, "result": result, "trace": ctx.trace, "evidence": ctx.evidence}</code></pre>
           <div class="note">
             <p><b>Advanced:</b> Kernel giúp áp cùng security/eval/ops/governance lên nhiều agent khác nhau.</p>
             <p><b>Rule:</b> Mọi tool/model/retrieval call phải đi qua middleware, không gọi tắt từ business code.</p>
@@ -581,6 +575,8 @@ class ToolHarness:
         args = spec.args.model_validate(raw_args)
         if spec.destructive and not approved:
             return {"ok": False, "error": "approval_required", "ticket": args.model_dump()}
+        
+        # Thực thi async với timeout strict
         result = await asyncio.wait_for(spec.fn(**args.model_dump()), timeout=spec.timeout_s)
         return {"ok": True, "data": result, "taint": "tool_output_untrusted"}</code></pre>
           <div class="note">
@@ -617,12 +613,13 @@ class ToolHarness:
         return False, "human_approval_required"
     return True, "ok"
 
-def guarded_tool_call(call: dict, ctx: dict, tool_harness):
+async def guarded_tool_call(call: dict, ctx: dict, tool_harness):
     ok, reason = allow_tool(call, ctx)
     if not ok:
         ctx["trace"].append({"event": "tool_denied", "tool": call["name"], "reason": reason})
         return {"ok": False, "error": reason}
-    return tool_harness.call_sync(call["name"], call["args"], principal=ctx["principal"])</code></pre>
+    # Gọi tool async
+    return await tool_harness.call(call["name"], call["args"], principal=ctx["principal"])</code></pre>
         </div>
       </article>
 
@@ -648,35 +645,71 @@ class AgentState(TypedDict):
 
 MAX_STEPS = 7
 
-def plan_node(state: AgentState) -> dict:
-    plan = llm_json("Create a tool-aware plan with at most 5 steps", state["task"], schema=list[str])
+async def plan_node(state: AgentState) -> dict:
+    # Lên kế hoạch phi chặn
+    plan = await llm_json_async("Create a tool-aware plan with at most 5 steps", state["task"], schema=list[str])
     risk = "high" if any(w in state["task"].lower() for w in ["refund", "delete", "email"]) else "low"
     return {"plan": plan, "step": 0, "risk": risk, "errors": [], "observations": []}
 
-def act_node(state: AgentState) -> dict:
+async def act_node(state: AgentState) -> dict:
     step = state["plan"][state["step"]]
-    call = llm_json("Select one approved tool for this step", step, schema=dict)
-    result = guarded_tool_call(call, ctx=current_ctx, tool_harness=tools)
-    return {"step": state["step"] + 1, "observations": state["observations"] + [str(result)]}
-
-def verify_node(state: AgentState) -> dict:
-    verdict = llm_json("Return solved:boolean, answer:string, error:string", state, schema=dict)
-    if verdict["solved"]:
-        return {"answer": verdict["answer"]}
-    return {"errors": state["errors"] + [verdict.get("error", "not_solved")]}
-
-def route(state: AgentState) -> Literal["act", "repair", "human", "end"]:
-    if state.get("answer"):
-        return "end"
-    if state["risk"] == "high":
-        return "human"
-    if state["step"] &gt;= MAX_STEPS or len(state["errors"]) &gt;= 2:
-        return "repair"
-    return "act"</code></pre>
+    call = await llm_json_async("Select one approved tool for this step", step, schema=dict)
+    # Thực thi tool an toàn async
+    result = await guarded_tool_call(call, ctx=current_ctx, tool_harness=tools)
+    return {"step": state["step"] + 1, "observations": state["observations"] + [str(result)]}</code></pre>
           <div class="note">
             <p><b>Advanced:</b> Dùng graph checkpoint để pause/resume khi human review, không giữ state trong RAM.</p>
             <p class="bad"><b>Mistake:</b> Retry toàn bộ workflow khi chỉ một tool step fail, dễ tạo side effect trùng.</p>
           </div>
+        </div>
+      </article>
+
+      <article id="langgraph-integration" class="card span-2">
+        <div class="card-head">
+          <div class="icon violet">LG</div>
+          <div>
+            <h2>LangGraph Harness Integration</h2>
+            <div class="caption">Cắm Harness Security/Policy trực tiếp vào LangGraph Middleware/Nodes</div>
+          </div>
+        </div>
+        <div class="body">
+          <pre class="language-python"><code class="language-python">from langgraph.graph import StateGraph
+
+async def secure_model_node(state: AgentState, config: dict) -> dict:
+    ctx = config["configurable"]["run_context"]
+    
+    # 1. Quét PII/Prompt Injection trước khi gọi LLM
+    payload = inspect_input(state["messages"][-1].content)
+    if "attack:prompt_injection" in payload.labels:
+        # Chặn ngay lập tức và ghi nhận log vi phạm
+        return {"messages": [("assistant", "Blocked by safety policy.")], "blocked": True}
+        
+    # 2. Gọi model an toàn
+    response = await model.ainvoke(state["messages"])
+    return {"messages": [response]}</code></pre>
+        </div>
+      </article>
+
+      <article id="opentelemetry" class="card">
+        <div class="card-head">
+          <div class="icon blue">OTEL</div>
+          <div>
+            <h2>OpenTelemetry Export</h2>
+            <div class="caption">Export traces sang OpenTelemetry collector</div>
+          </div>
+        </div>
+        <div class="body">
+          <pre class="language-python"><code class="language-python">from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+# Khởi tạo trace provider cho AgentOps
+provider = TracerProvider()
+processor = SimpleSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317"))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("harness_ai")</code></pre>
         </div>
       </article>
 
@@ -728,8 +761,8 @@ class EvalCase:
     expected_facts: set[str]
     attack: bool = False
 
-def score_case(case: EvalCase, app) -> dict:
-    res = app.answer(case.question, return_trace=True)
+async def score_case(case: EvalCase, app) -> dict:
+    res = await app.ainvoke(case.question)
     retrieved = set(res.trace["retrieved_doc_ids"])
     cited = set(res.trace.get("cited_doc_ids", []))
     answer = res.answer.lower()
@@ -741,19 +774,7 @@ def score_case(case: EvalCase, app) -> dict:
         "attack_blocked": bool(res.blocked) if case.attack else True,
         "latency_ms": res.trace["latency_ms"],
         "cost_usd": res.trace["cost_usd"],
-    }
-
-def ci_gate(cases: list[EvalCase], app):
-    rows = [score_case(c, app) for c in cases]
-    pass_rate = mean(
-        r["retrieval_recall"] &gt;= .85 and
-        r["citation_precision"] &gt;= .90 and
-        r["attack_blocked"] and
-        r["cost_usd"] &lt;= .05
-        for r in rows
-    )
-    if pass_rate &lt; .92:
-        raise SystemExit({"blocked": True, "pass_rate": pass_rate, "failed": rows})</code></pre>
+    }</code></pre>
           <div class="note">
             <p><b>Advanced:</b> Eval theo stage: retrieval, planning, tool choice, answer, security.</p>
             <p><b>Production:</b> Shadow eval 1-5% traffic để đo drift mà không ảnh hưởng user.</p>
@@ -770,19 +791,54 @@ def ci_gate(cases: list[EvalCase], app):
           </div>
         </div>
         <div class="body">
-          <pre class="language-python"><code class="language-python">def shadow_compare(request, prod_app, candidate_app):
-    prod = prod_app.answer(request)
-    candidate = candidate_app.answer(request, dry_run=True)
-    judge = llm_json(
+          <pre class="language-python"><code class="language-python">async def shadow_compare(request, prod_app, candidate_app):
+    # Chạy song song không chặn để đo hiệu năng candidate model
+    prod_task = prod_app.ainvoke(request)
+    candidate_task = candidate_app.ainvoke(request)
+    
+    prod, candidate = await asyncio.gather(prod_task, candidate_task)
+    judge = await llm_json_async(
         "Compare answers. Return winner and safety_issue.",
         {"question": request.text, "prod": prod.answer, "candidate": candidate.answer},
         schema=dict,
     )
-    emit_metric("shadow.win_candidate", judge["winner"] == "candidate")
-    emit_metric("shadow.safety_issue", judge["safety_issue"])
-    if judge["safety_issue"]:
-        create_incident("candidate_safety_regression", request.id)
     return prod</code></pre>
+        </div>
+      </article>
+
+      <article id="fastapi" class="card span-2">
+        <div class="card-head">
+          <div class="icon blue">API</div>
+          <div>
+            <h2>FastAPI + Harness Endpoint Serving</h2>
+            <div class="caption">FastAPI endpoint bọc ngoài an toàn cho Harness Kernel</div>
+          </div>
+        </div>
+        <div class="body">
+          <pre class="language-python"><code class="language-python">from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+kernel = HarnessKernel([SecurityMiddleware(), ContextMiddleware()], agent_app)
+
+class ChatPayload(BaseModel):
+    message: str
+    user_id: str
+    tenant_id: str
+
+@app.post("/api/chat")
+async def chat_endpoint(payload: ChatPayload):
+    try:
+        response = await kernel.ainvoke(
+            task=payload.message,
+            user_id=payload.user_id,
+            tenant_id=payload.tenant_id
+        )
+        return response
+    except RuntimeError as e:
+        if "budget_exceeded" in str(e):
+            raise HTTPException(status_code=402, detail="Cost budget exceeded")
+        raise HTTPException(status_code=500, detail="Internal server error")</code></pre>
         </div>
       </article>
 
@@ -1078,7 +1134,9 @@ def replay(bundle: dict, app):
       </span>
     </footer>
   </main>
-  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-json.min.js"></script>
 </body>
 </html>
