@@ -331,7 +331,7 @@
           <div class="mini">
             <div class="fact"><b>Concept</b> Harness là runtime + policy + telemetry + eval bao quanh prompt/model/tool.</div>
             <div class="fact"><b>Use when</b> RAG, agent tool-use, multi-agent, regulated workflow, app có chi phí/side effect thật.</div>
-            <div class="fact"><b>Not enough</b> Chỉ có prompt tốt hoặc framework agent chưa đủ để vận hành production.</div>
+            <div class="fact"><b>Positioning</b> Reference architecture/pattern, không phải official SDK riêng như LangChain.</div>
             <div class="fact"><b>Goal</b> Mỗi quyết định AI phải có context, policy, trace, eval và rollback path.</div>
           </div>
           <pre class="language-python"><code class="language-python"># Mental model
@@ -633,6 +633,10 @@ async def guarded_tool_call(call: dict, ctx: dict, tool_harness):
         </div>
         <div class="body">
           <pre class="language-python"><code class="language-python">from typing import Literal, TypedDict
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from langgraph.runtime import Runtime
 
 class AgentState(TypedDict):
     task: str
@@ -643,20 +647,42 @@ class AgentState(TypedDict):
     risk: Literal["low", "medium", "high"]
     answer: str | None
 
+class ToolCall(BaseModel):
+    name: str = Field(description="Approved tool name")
+    args: dict = Field(default_factory=dict)
+
+class Plan(BaseModel):
+    steps: list[str] = Field(description="At most five safe tool steps")
+
 MAX_STEPS = 7
+planner = ChatOpenAI(model="gpt-4.1-mini", temperature=0).with_structured_output(Plan)
+tool_selector = ChatOpenAI(model="gpt-4.1-mini", temperature=0).with_structured_output(ToolCall)
 
-async def plan_node(state: AgentState) -> dict:
-    # Lên kế hoạch phi chặn
-    plan = await llm_json_async("Create a tool-aware plan with at most 5 steps", state["task"], schema=list[str])
+async def plan_node(state: AgentState, runtime: Runtime) -> dict:
+    plan = await planner.ainvoke(f"Create at most 5 safe tool steps for: {state['task']}")
     risk = "high" if any(w in state["task"].lower() for w in ["refund", "delete", "email"]) else "low"
-    return {"plan": plan, "step": 0, "risk": risk, "errors": [], "observations": []}
+    return {"plan": plan.steps, "step": 0, "risk": risk, "errors": [], "observations": []}
 
-async def act_node(state: AgentState) -> dict:
+async def act_node(state: AgentState, runtime: Runtime) -> dict:
     step = state["plan"][state["step"]]
-    call = await llm_json_async("Select one approved tool for this step", step, schema=dict)
-    # Thực thi tool an toàn async
-    result = await guarded_tool_call(call, ctx=current_ctx, tool_harness=tools)
-    return {"step": state["step"] + 1, "observations": state["observations"] + [str(result)]}</code></pre>
+    call = await tool_selector.ainvoke(f"Select one approved tool for step: {step}")
+    result = await runtime.context["tool_harness"].call(
+        call.name,
+        call.args,
+        principal=runtime.context["principal"],
+    )
+    return {"step": state["step"] + 1, "observations": [str(result)]}
+
+def route(state: AgentState) -> str:
+    return END if state["step"] >= min(len(state["plan"]), MAX_STEPS) else "act"
+
+builder = StateGraph(AgentState)
+builder.add_node("plan", plan_node)
+builder.add_node("act", act_node)
+builder.set_entry_point("plan")
+builder.add_conditional_edges("plan", route, {"act": "act", END: END})
+builder.add_conditional_edges("act", route, {"act": "act", END: END})
+harness_graph = builder.compile()</code></pre>
           <div class="note">
             <p><b>Advanced:</b> Dùng graph checkpoint để pause/resume khi human review, không giữ state trong RAM.</p>
             <p class="bad"><b>Mistake:</b> Retry toàn bộ workflow khi chỉ một tool step fail, dễ tạo side effect trùng.</p>
@@ -791,18 +817,27 @@ async def score_case(case: EvalCase, app) -> dict:
           </div>
         </div>
         <div class="body">
-          <pre class="language-python"><code class="language-python">async def shadow_compare(request, prod_app, candidate_app):
+          <pre class="language-python"><code class="language-python">import asyncio
+from pydantic import BaseModel
+from langchain_openai import ChatOpenAI
+
+class ShadowJudge(BaseModel):
+    winner: str
+    safety_issue: bool
+    reason: str
+
+judge_model = ChatOpenAI(model="gpt-4.1-mini", temperature=0).with_structured_output(ShadowJudge)
+
+async def shadow_compare(request, prod_app, candidate_app):
     # Chạy song song không chặn để đo hiệu năng candidate model
     prod_task = prod_app.ainvoke(request)
     candidate_task = candidate_app.ainvoke(request)
     
     prod, candidate = await asyncio.gather(prod_task, candidate_task)
-    judge = await llm_json_async(
-        "Compare answers. Return winner and safety_issue.",
-        {"question": request.text, "prod": prod.answer, "candidate": candidate.answer},
-        schema=dict,
+    judge = await judge_model.ainvoke(
+        f"Question: {request.text}\nPROD: {prod.answer}\nCANDIDATE: {candidate.answer}"
     )
-    return prod</code></pre>
+    return {"prod": prod, "candidate": candidate, "judge": judge}</code></pre>
         </div>
       </article>
 
@@ -1117,6 +1152,51 @@ def replay(bundle: dict, app):
             <li><code>NIST AI RMF</code><br>Govern, map, measure, manage cho risk management.</li>
             <li><code>OpenTelemetry / LangSmith</code><br>Trace, span, metrics, debugging và monitoring LLM apps.</li>
             <li><code>Harness AI</code><br>Lớp kết hợp tất cả: policy + eval + runtime + audit + operations.</li>
+          </ul>
+        </div>
+      </article>
+
+      <article id="risk-frameworks" class="card span-3">
+        <div class="card-head">
+          <div class="icon red">RMF</div>
+          <div>
+            <h2>Risk Framework Mapping</h2>
+            <div class="caption">Map harness controls to OWASP GenAI risks and NIST AI RMF functions</div>
+          </div>
+        </div>
+        <div class="body">
+          <table>
+            <thead>
+              <tr><th>Risk / Function</th><th>Harness control</th><th>Evidence to keep</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Prompt injection</td><td>Context tainting, instruction hierarchy, tool allowlists</td><td>blocked attack traces, prompt versions</td></tr>
+              <tr><td>Sensitive data disclosure</td><td>PII filters, tenant retrieval filters, output redaction</td><td>access logs, redaction decisions</td></tr>
+              <tr><td>Excessive agency</td><td>Human approval, scoped tool permissions, budget limits</td><td>approval records, tool call audit</td></tr>
+              <tr><td>NIST Govern</td><td>Ownership, policy registry, release evidence manifest</td><td>approver, model/index versions</td></tr>
+              <tr><td>NIST Measure/Manage</td><td>Eval gates, monitoring, rollback, incident replay</td><td>eval reports, drift alerts, replay bundles</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+      <article id="keywords" class="card span-3">
+        <div class="card-head">
+          <div class="icon gold">KEY</div>
+          <div>
+            <h2>Keywords</h2>
+            <div class="caption">Core terms for the HarnessAI reference architecture</div>
+          </div>
+        </div>
+        <div class="body">
+          <ul class="mono-list">
+            <li><code>Harness</code><br>Reference architecture around model calls that adds policy, context, eval, telemetry, and rollback.</li>
+            <li><code>ContextPack</code><br>Budgeted, cited, permission-filtered context bundle passed into model execution.</li>
+            <li><code>Tool policy</code><br>RBAC, argument validation, approvals, egress checks, and timeout controls around tool calls.</li>
+            <li><code>Trace</code><br>Structured record of model, retrieval, tool, cost, latency, and decision events for a run.</li>
+            <li><code>Eval gate</code><br>Automated quality/safety threshold required before release or traffic promotion.</li>
+            <li><code>Canary token</code><br>Secret marker inserted to detect prompt leakage or unsafe tool egress.</li>
+            <li><code>Replay bundle</code><br>Frozen inputs, context ids, tool fixtures, prompts, and seeds used to reproduce a production run.</li>
+            <li><code>Evidence manifest</code><br>Auditable release artifact containing versions, evals, approver, and rollback target.</li>
           </ul>
         </div>
       </article>
